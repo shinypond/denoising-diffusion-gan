@@ -187,6 +187,14 @@ def sample_from_model(coefficients, generator, n_time, x_init, T, opt):
     return x
 
 #%%
+
+def D_regularize(D_real, img_real, r1_gamma):
+    grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=img_real, create_graph=True)[0]
+    grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
+    grad_penalty = r1_gamma / 2 * grad_penalty
+    return grad_penalty
+
+
 def train(rank, gpu, args):
     from score_sde.models.discriminator import Discriminator_small, Discriminator_large
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
@@ -325,93 +333,58 @@ def train(rank, gpu, args):
         train_sampler.set_epoch(epoch)
        
         for iteration, (x, y) in enumerate(data_loader):
-            for p in netD.parameters():  
-                p.requires_grad = True  
-        
-            
-            netD.zero_grad()
-            
-            #sample from p(x_0)
-            real_data = x.to(device, non_blocking=True)
-            
-            #sample t
-            t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
-            
-            x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-            x_t.requires_grad = True
-            
-            # train with real
-            D_real = netD(x_t, t, x_tp1.detach()).view(-1)
-            
-            errD_real = F.softplus(-D_real)
-            errD_real = errD_real.mean()
-            
-            errD_real.backward(retain_graph=True)
-            
-            
-            if args.lazy_reg is None:
-                grad_real = torch.autograd.grad(
-                            outputs=D_real.sum(), inputs=x_t, create_graph=True
-                            )[0]
-                grad_penalty = (
-                                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
-                                ).mean()
+
+            # Update D
+            for _ in range(args.D_update_iters):
+                for p in netD.parameters():  
+                    p.requires_grad = True  
+                netD.zero_grad()
+
+                # sample from p(x_0)
+                real_data = x.to(device, non_blocking=True)
                 
+                # sample t
+                t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
+                x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
+                x_t.requires_grad = True
                 
-                grad_penalty = args.r1_gamma / 2 * grad_penalty
-                grad_penalty.backward()
-            else:
-                if global_step % args.lazy_reg == 0:
-                    grad_real = torch.autograd.grad(
-                            outputs=D_real.sum(), inputs=x_t, create_graph=True
-                            )[0]
-                    grad_penalty = (
-                                grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2
-                                ).mean()
-                
-                
-                    grad_penalty = args.r1_gamma / 2 * grad_penalty
+                # (1) D_real
+                D_real = netD(x_t, t, x_tp1.detach()).view(-1)
+                errD_real = F.softplus(-D_real)
+                errD_real = errD_real.mean()
+
+                # (2) D_fake
+                latent_z = torch.randn(batch_size, nz, device=device)
+                x_0_predict = netG(x_tp1.detach(), t, latent_z)
+                x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+                output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+                errD_fake = F.softplus(output)
+                errD_fake = errD_fake.mean()
+
+                errD = errD_real + errD_fake
+                errD.backward()
+
+                # (3) R1 Regularization
+                if (args.lazy_reg is None) or (global_step % args.lazy_reg == 0):
+                    grad_penalty = D_regularize(D_real, x_t, args.r1_gamma)
                     grad_penalty.backward()
 
-            # train with fake
-            latent_z = torch.randn(batch_size, nz, device=device)
-            x_0_predict = netG(x_tp1.detach(), t, latent_z)
-            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-            
-            errD_fake = F.softplus(output)
-            errD_fake = errD_fake.mean()
-            errD_fake.backward()
-    
-            errD = errD_real + errD_fake
-            # Update D
-            optimizerD.step()
-            
+                optimizerD.step()
         
             # Update G
             for p in netD.parameters():
                 p.requires_grad = False
             netG.zero_grad()
-            
-            
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
-            
-            
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-            
             latent_z = torch.randn(batch_size, nz,device=device)
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
             x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
             output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-               
-            
             errG = F.softplus(-output)
             errG = errG.mean()
-            
             errG.backward()
             optimizerG.step()
-                
-           
             
             global_step += 1
             if iteration % 100 == 0:
@@ -549,6 +522,9 @@ if __name__ == '__main__':
     parser.add_argument('--r1_gamma', type=float, default=0.05, help='coef for r1 reg')
     parser.add_argument('--lazy_reg', type=int, default=None,
                         help='lazy regulariation.')
+
+    # ADDED
+    parser.add_argument('--D-update-iters', type=int, default=1, help='Wasserstein Critic update iteration numbers')
 
     parser.add_argument('--save_content', action='store_true',default=False)
     parser.add_argument('--save_content_every', type=int, default=50, help='save content for resuming every x epochs')
