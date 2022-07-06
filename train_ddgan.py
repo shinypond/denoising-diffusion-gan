@@ -254,7 +254,11 @@ def train(rank, gpu, args):
     
 
     if args.dataset == 'cifar10' or args.dataset == 'stackmnist':    
-        netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
+        # Modified !
+        # netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
+        #                        t_emb_dim = args.t_emb_dim,
+        #                        act=nn.LeakyReLU(0.2)).to(device)
+        netD = Discriminator_small(nc = args.num_channels, ngf = args.ngf,
                                t_emb_dim = args.t_emb_dim,
                                act=nn.LeakyReLU(0.2)).to(device)
     else:
@@ -266,7 +270,6 @@ def train(rank, gpu, args):
     broadcast_params(netD.parameters())
     
     optimizerD = optim.Adam(netD.parameters(), lr=args.lr_d, betas = (args.beta1, args.beta2))
-    
     optimizerG = optim.Adam(netG.parameters(), lr=args.lr_g, betas = (args.beta1, args.beta2))
     
     if args.use_ema:
@@ -337,7 +340,6 @@ def train(rank, gpu, args):
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
             x_t.requires_grad = True
             
-    
             # train with real
             D_real = netD(x_t, t, x_tp1.detach()).view(-1)
             
@@ -373,25 +375,20 @@ def train(rank, gpu, args):
 
             # train with fake
             latent_z = torch.randn(batch_size, nz, device=device)
-            
-         
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
             x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            
             output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-                
             
             errD_fake = F.softplus(output)
             errD_fake = errD_fake.mean()
             errD_fake.backward()
     
-            
             errD = errD_real + errD_fake
             # Update D
             optimizerD.step()
             
         
-            #update G
+            # Update G
             for p in netD.parameters():
                 p.requires_grad = False
             netG.zero_grad()
@@ -401,16 +398,10 @@ def train(rank, gpu, args):
             
             
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-                
             
             latent_z = torch.randn(batch_size, nz,device=device)
-            
-            
-                
-           
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
             x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            
             output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
                
             

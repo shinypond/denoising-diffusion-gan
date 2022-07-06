@@ -44,3 +44,7 @@ Thumbs.db
 *.mov
 *.wmv
 
+
+# CUSTOM
+data/
+saved_info/
