@@ -28,13 +28,14 @@ from torch.multiprocessing import Process
 import torch.distributed as dist
 import shutil
 
+from score_sde.models.discriminator import ConditionalDiscriminator, MarginalDiscriminator
+
 def copy_source(file, output_dir):
     shutil.copyfile(file, os.path.join(output_dir, os.path.basename(file)))
             
 def broadcast_params(params):
     for param in params:
         dist.broadcast(param.data, src=0)
-
 
 #%% Diffusion coefficients 
 def var_func_vp(t, beta_min, beta_max):
@@ -194,7 +195,6 @@ def D_regularize(D_real, img_real, r1_gamma):
     grad_penalty = r1_gamma / 2 * grad_penalty
     return grad_penalty
 
-
 def train(rank, gpu, args):
     from score_sde.models.discriminator import Discriminator_small, Discriminator_large
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
@@ -234,7 +234,6 @@ def train(rank, gpu, args):
         subset = list(range(0, 120000))
         dataset = torch.utils.data.Subset(train_data, subset)
       
-    
     elif args.dataset == 'celeba_256':
         train_transform = transforms.Compose([
                 transforms.Resize(args.image_size),
@@ -259,23 +258,26 @@ def train(rank, gpu, args):
     
     netG = NCSNpp(args).to(device)
     
-
-    if args.dataset == 'cifar10' or args.dataset == 'stackmnist':    
-        # Modified !
-        # netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
-        #                        t_emb_dim = args.t_emb_dim,
-        #                        act=nn.LeakyReLU(0.2)).to(device)
-        netD = Discriminator_small(
-            nc=2*args.num_channels,
+    if args.marginal:
+        netD = MarginalDiscriminator(
+            nc=args.num_channels,
             ngf=args.ngf,
+            ch_mult=args.D_ch_mult,
+            downsamples=args.downsamples,
             t_emb_dim = args.t_emb_dim,
             act=nn.LeakyReLU(0.2),
             spectral_norm=args.spectral_norm,
         ).to(device)
     else:
-        netD = Discriminator_large(nc = 2*args.num_channels, ngf = args.ngf, 
-                                   t_emb_dim = args.t_emb_dim,
-                                   act=nn.LeakyReLU(0.2)).to(device)
+        netD = ConditionalDiscriminator(
+            nc=args.num_channels*2,
+            ngf=args.ngf,
+            ch_mult=args.D_ch_mult,
+            downsamples=args.downsamples,
+            t_emb_dim = args.t_emb_dim,
+            act=nn.LeakyReLU(0.2),
+            spectral_norm=args.spectral_norm,
+        ).to(device)
     
     broadcast_params(netG.parameters())
     broadcast_params(netD.parameters())
@@ -331,9 +333,9 @@ def train(rank, gpu, args):
         global_step, epoch, init_epoch = 0, 0, 0
     
     
-    # print(sum(p.numel() for p in netG.parameters()))
-    # print(sum(p.numel() for p in netD.parameters()))
-    # assert 0
+    print(f'Parameter number of Generator : {sum(p.numel() for p in netG.parameters())}')
+    print(f'Parameter number of Discriminator : {sum(p.numel() for p in netD.parameters())}')
+    
     for epoch in range(init_epoch, args.num_epoch+1):
         train_sampler.set_epoch(epoch)
        
@@ -371,10 +373,9 @@ def train(rank, gpu, args):
                     errD_fake = F.softplus(D_fake).mean()
                     errD = errD_real + errD_fake
                 elif args.loss_type == 'wasserstein':
-                    # errD = -D_real.mean() + D_fake.mean()
                     errD = F.relu(1. - D_real, inplace=True).mean() + F.relu(1. + D_fake, inplace=True).mean()
                 else:
-                    assert 0
+                    raise NotImplementedError
 
                 errD.backward(retain_graph=True)
 
@@ -407,14 +408,14 @@ def train(rank, gpu, args):
             elif args.loss_type == 'wasserstein':
                 errG = -D_fake.mean()
             else:
-                assert 0
+                raise NotImplementedError
 
             errG.backward()
 
             optimizerG.step()
             
             global_step += 1
-            if iteration % 1 == 0:
+            if iteration % 100 == 0:
                 if rank == 0:
                     print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
         
@@ -446,7 +447,6 @@ def train(rank, gpu, args):
                 torch.save(netG.state_dict(), os.path.join(exp_path, 'netG_{}.pth'.format(epoch)))
                 if args.use_ema:
                     optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
-            
 
 
 def init_processes(rank, size, fn, args):
@@ -467,9 +467,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
-    
     parser.add_argument('--resume', action='store_true',default=False)
-    
     parser.add_argument('--image_size', type=int, default=32,
                             help='size of image')
     parser.add_argument('--num_channels', type=int, default=3,
@@ -501,8 +499,7 @@ if __name__ == '__main__':
                             help='noise conditional')
     parser.add_argument('--fir', action='store_false', default=True,
                             help='FIR')
-    parser.add_argument('--fir_kernel', default=[1, 3, 3, 1],
-                            help='FIR kernel')
+    parser.add_argument('--fir_kernel', default=[1, 3, 3, 1], help='FIR kernel')
     parser.add_argument('--skip_rescale', action='store_false', default=True,
                             help='skip rescale')
     parser.add_argument('--resblock_type', default='biggan',
@@ -534,40 +531,37 @@ if __name__ == '__main__':
 
     parser.add_argument('--lr_g', type=float, default=1.5e-4, help='learning rate g')
     parser.add_argument('--lr_d', type=float, default=1e-4, help='learning rate d')
-    parser.add_argument('--beta1', type=float, default=0.5,
-                            help='beta1 for adam')
-    parser.add_argument('--beta2', type=float, default=0.9,
-                            help='beta2 for adam')
+    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for adam')
+    parser.add_argument('--beta2', type=float, default=0.9, help='beta2 for adam')
     parser.add_argument('--no_lr_decay',action='store_true', default=False)
     
-    parser.add_argument('--use_ema', action='store_true', default=False,
-                            help='use EMA or not')
+    parser.add_argument('--use_ema', action='store_true', default=False, help='use EMA or not')
     parser.add_argument('--ema_decay', type=float, default=0.9999, help='decay rate for EMA')
     
     parser.add_argument('--r1_gamma', type=float, default=0.05, help='coef for r1 reg')
-    parser.add_argument('--lazy_reg', type=int, default=None,
-                        help='lazy regulariation.')
-
+    parser.add_argument('--lazy_reg', type=int, default=None, help='lazy regulariation.')
+    
     # (Added) For Wasserstein loss
-    parser.add_argument('--loss-type', type=str, default='logistic', choices=['logistic', 'wasserstein'], help='Type of GAN Loss')
-    parser.add_argument('--D-update-iters', type=int, default=1, help='Wasserstein Critic update iteration numbers')
-    parser.add_argument('--spectral-norm', action='store_true', default=False, help='Spectral Normalization')
+    parser.add_argument('--loss_type', type=str, default='logistic', choices=['logistic', 'wasserstein'], help='Type of GAN Loss')
+    parser.add_argument('--D_update_iters', type=int, default=1, help='Wasserstein Critic update iteration numbers')
+    parser.add_argument('--spectral_norm', action='store_true', default=False, help='Spectral Normalization')
+    
+    # (Added) For Marginal Discriminator
+    parser.add_argument('--marginal', action='store_true', default=False)
+    parser.add_argument('--D_ch_mult', default=[2,2,4,8,8])
+    parser.add_argument('--downsamples', default=[0,1,1,1])
 
+    # Save
     parser.add_argument('--save_content', action='store_true', default=False)
     parser.add_argument('--save_content_every', type=int, default=50, help='save content for resuming every x epochs')
     parser.add_argument('--save_ckpt_every', type=int, default=25, help='save ckpt every x epochs')
    
     ###ddp
-    parser.add_argument('--num_proc_node', type=int, default=1,
-                        help='The number of nodes in multi node env.')
-    parser.add_argument('--num_process_per_node', type=int, default=1,
-                        help='number of gpus')
-    parser.add_argument('--node_rank', type=int, default=0,
-                        help='The index of node.')
-    parser.add_argument('--local_rank', type=int, default=0,
-                        help='rank of process in the node')
-    parser.add_argument('--master_address', type=str, default='127.0.0.1',
-                        help='address for master')
+    parser.add_argument('--num_proc_node', type=int, default=1, help='The number of nodes in multi node env.')
+    parser.add_argument('--num_process_per_node', type=int, default=1, help='number of gpus')
+    parser.add_argument('--node_rank', type=int, default=0, help='The index of node.')
+    parser.add_argument('--local_rank', type=int, default=0, help='rank of process in the node')
+    parser.add_argument('--master_address', type=str, default='127.0.0.1', help='address for master')
 
    
     args = parser.parse_args()
@@ -592,5 +586,3 @@ if __name__ == '__main__':
         print('starting in debug mode')
         
         init_processes(0, size, train, args)
-   
-                
