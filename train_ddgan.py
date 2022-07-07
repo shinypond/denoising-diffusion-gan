@@ -215,7 +215,6 @@ def train(rank, gpu, args):
                         transforms.RandomHorizontalFlip(),
                         transforms.ToTensor(),
                         transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))]), download=True)
-       
     
     elif args.dataset == 'stackmnist':
         train_transform, valid_transform = _data_transforms_stacked_mnist()
@@ -266,9 +265,13 @@ def train(rank, gpu, args):
         # netD = Discriminator_small(nc = 2*args.num_channels, ngf = args.ngf,
         #                        t_emb_dim = args.t_emb_dim,
         #                        act=nn.LeakyReLU(0.2)).to(device)
-        netD = Discriminator_small(nc = args.num_channels, ngf = args.ngf,
-                               t_emb_dim = args.t_emb_dim,
-                               act=nn.LeakyReLU(0.2)).to(device)
+        netD = Discriminator_small(
+            nc=2*args.num_channels,
+            ngf=args.ngf,
+            t_emb_dim = args.t_emb_dim,
+            act=nn.LeakyReLU(0.2),
+            spectral_norm=args.spectral_norm,
+        ).to(device)
     else:
         netD = Discriminator_large(nc = 2*args.num_channels, ngf = args.ngf, 
                                    t_emb_dim = args.t_emb_dim,
@@ -315,7 +318,6 @@ def train(rank, gpu, args):
         epoch = init_epoch
         netG.load_state_dict(checkpoint['netG_dict'])
         # load G
-        
         optimizerG.load_state_dict(checkpoint['optimizerG'])
         schedulerG.load_state_dict(checkpoint['schedulerG'])
         # load D
@@ -329,77 +331,100 @@ def train(rank, gpu, args):
         global_step, epoch, init_epoch = 0, 0, 0
     
     
+    # print(sum(p.numel() for p in netG.parameters()))
+    # print(sum(p.numel() for p in netD.parameters()))
+    # assert 0
     for epoch in range(init_epoch, args.num_epoch+1):
         train_sampler.set_epoch(epoch)
        
         for iteration, (x, y) in enumerate(data_loader):
 
-            # Update D
+            # (0) Sample real data
+            real_data = x.to(device, non_blocking=True)
+
+            # (1) Update D
+            for p in netD.parameters():  
+                p.requires_grad = True  
+
             for _ in range(args.D_update_iters):
-                for p in netD.parameters():  
-                    p.requires_grad = True  
+
                 netD.zero_grad()
 
-                # sample from p(x_0)
-                real_data = x.to(device, non_blocking=True)
-                
-                # sample t
+                # (1-1) Sample t, x_t, x_(t+1)
                 t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
                 x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
                 x_t.requires_grad = True
                 
-                # (1) D_real
+                # (1-2) Get D_real
                 D_real = netD(x_t, t, x_tp1.detach()).view(-1)
-                errD_real = F.softplus(-D_real)
-                errD_real = errD_real.mean()
 
-                # (2) D_fake
+                # (1-3) Get D_fake using G
                 latent_z = torch.randn(batch_size, nz, device=device)
                 x_0_predict = netG(x_tp1.detach(), t, latent_z)
                 x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-                output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-                errD_fake = F.softplus(output)
-                errD_fake = errD_fake.mean()
+                D_fake = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
 
-                errD = errD_real + errD_fake
-                errD.backward()
+                # (1-4) Backward D_loss
+                if args.loss_type == 'logistic':
+                    assert args.D_update_iters == 1 # No additional updates for critic (discriminator)
+                    errD_real = F.softplus(-D_real).mean()
+                    errD_fake = F.softplus(D_fake).mean()
+                    errD = errD_real + errD_fake
+                elif args.loss_type == 'wasserstein':
+                    # errD = -D_real.mean() + D_fake.mean()
+                    errD = F.relu(1. - D_real, inplace=True).mean() + F.relu(1. + D_fake, inplace=True).mean()
+                else:
+                    assert 0
 
-                # (3) R1 Regularization
+                errD.backward(retain_graph=True)
+
+                # (1-5) R1 Regularization
                 if (args.lazy_reg is None) or (global_step % args.lazy_reg == 0):
                     grad_penalty = D_regularize(D_real, x_t, args.r1_gamma)
                     grad_penalty.backward()
 
                 optimizerD.step()
         
-            # Update G
+            # (2) Update G
             for p in netD.parameters():
                 p.requires_grad = False
+
             netG.zero_grad()
+
+            # (2-1) Sample t, x_t, x_(t+1)
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
+
+            # (2-2) Get D_fake using G
             latent_z = torch.randn(batch_size, nz,device=device)
             x_0_predict = netG(x_tp1.detach(), t, latent_z)
             x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-            errG = F.softplus(-output)
-            errG = errG.mean()
+            D_fake = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+
+            # (2-3) Backward G_loss
+            if args.loss_type == 'logistic':
+                errG = F.softplus(-D_fake).mean()
+            elif args.loss_type == 'wasserstein':
+                errG = -D_fake.mean()
+            else:
+                assert 0
+
             errG.backward()
+
             optimizerG.step()
             
             global_step += 1
-            if iteration % 100 == 0:
+            if iteration % 1 == 0:
                 if rank == 0:
                     print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
         
         if not args.no_lr_decay:
-            
             schedulerG.step()
             schedulerD.step()
         
         if rank == 0:
             if epoch % 10 == 0:
                 torchvision.utils.save_image(x_pos_sample, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
-            
             x_t_1 = torch.randn_like(real_data)
             fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1, T, args)
             torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=True)
@@ -523,10 +548,12 @@ if __name__ == '__main__':
     parser.add_argument('--lazy_reg', type=int, default=None,
                         help='lazy regulariation.')
 
-    # ADDED
+    # (Added) For Wasserstein loss
+    parser.add_argument('--loss-type', type=str, default='logistic', choices=['logistic', 'wasserstein'], help='Type of GAN Loss')
     parser.add_argument('--D-update-iters', type=int, default=1, help='Wasserstein Critic update iteration numbers')
+    parser.add_argument('--spectral-norm', action='store_true', default=False, help='Spectral Normalization')
 
-    parser.add_argument('--save_content', action='store_true',default=False)
+    parser.add_argument('--save_content', action='store_true', default=False)
     parser.add_argument('--save_content_every', type=int, default=50, help='save content for resuming every x epochs')
     parser.add_argument('--save_ckpt_every', type=int, default=25, help='save ckpt every x epochs')
    
