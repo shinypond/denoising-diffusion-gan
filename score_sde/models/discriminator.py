@@ -115,7 +115,7 @@ class MarginalDiscriminator(nn.Module):
         if spectral_norm:
             self.start_conv = nn.utils.spectral_norm(self.start_conv)
             self.final_conv = nn.utils.spectral_norm(self.final_conv)
-            self.end_linear = nn.utils.spectral_norm(self.end_linear)
+            # self.end_linear = nn.utils.spectral_norm(self.end_linear)
             
     def forward(self, x, t, x_t):
         t_embed = self.act(self.t_embed(t))  
@@ -145,8 +145,10 @@ class MarginalDiscriminator(nn.Module):
 
 class ConditionalDiscriminator(nn.Module):
     """A time-dependent discriminator for small images (CIFAR10, StackMNIST)."""
-    def __init__(self, nc=3, ngf=64, ch_mult=[2,2,4,8], t_emb_dim=128, act=nn.LeakyReLU(0.2), spectral_norm=False):
+    def __init__(self, nc=3, ngf=64, ch_mult=[2,2,4,8,8], downsamples=[0,1,1,1], t_emb_dim=128, act=nn.LeakyReLU(0.2), spectral_norm=False):
         super().__init__()
+        assert len(ch_mult) == len(downsamples) + 1
+        
         # Gaussian random feature embedding layer for time
         self.act = act
         
@@ -164,10 +166,8 @@ class ConditionalDiscriminator(nn.Module):
         modules = []
         for k in range(len(ch_mult)-1):
             in_ch, out_ch = ngf*ch_mult[k], ngf*ch_mult[k+1]
-            modules.append(DownConvBlock(in_ch, out_ch, t_emb_dim=t_emb_dim, downsample=bool(in_ch!=out_ch), act=act, spectral_norm=spectral_norm))
-        
-        modules.append(DownConvBlock(out_ch, out_ch, t_emb_dim=t_emb_dim, downsample=True, act=act, spectral_norm=spectral_norm))
-        
+            modules.append(DownConvBlock(in_ch, out_ch, t_emb_dim=t_emb_dim, downsample=downsamples[k], act=act, spectral_norm=spectral_norm))
+                    
         self.main = nn.ModuleList(modules)
         
         self.final_conv = conv2d(out_ch+1, out_ch, 3,padding=1, init_scale=0.)
@@ -179,12 +179,12 @@ class ConditionalDiscriminator(nn.Module):
         if spectral_norm:
             self.start_conv = nn.utils.spectral_norm(self.start_conv)
             self.final_conv = nn.utils.spectral_norm(self.final_conv)
-            self.end_linear = nn.utils.spectral_norm(self.end_linear)
+            # self.end_linear = nn.utils.spectral_norm(self.end_linear)
             
     def forward(self, x, t, x_t):
         t_embed = self.act(self.t_embed(t))  
         input_x = torch.cat((x, x_t), dim = 1)
-        #input_x = x
+        # input_x = x
         
         out = self.start_conv(input_x)
         for module in self.main:

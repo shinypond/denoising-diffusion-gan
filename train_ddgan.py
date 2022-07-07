@@ -196,7 +196,6 @@ def D_regularize(D_real, img_real, r1_gamma):
     return grad_penalty
 
 def train(rank, gpu, args):
-    from score_sde.models.discriminator import Discriminator_small, Discriminator_large
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
     from EMA import EMA
     
@@ -251,7 +250,7 @@ def train(rank, gpu, args):
     data_loader = torch.utils.data.DataLoader(dataset,
                                                batch_size=batch_size,
                                                shuffle=False,
-                                               num_workers=4,
+                                               num_workers=0,
                                                pin_memory=True,
                                                sampler=train_sampler,
                                                drop_last = True)
@@ -415,7 +414,7 @@ def train(rank, gpu, args):
             optimizerG.step()
             
             global_step += 1
-            if iteration % 100 == 0:
+            if iteration % 10 == 0:
                 if rank == 0:
                     print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
         
@@ -464,6 +463,7 @@ def cleanup():
     dist.destroy_process_group()    
 #%%
 if __name__ == '__main__':
+    torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
