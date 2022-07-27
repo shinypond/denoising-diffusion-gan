@@ -129,7 +129,7 @@ def sample_from_model(coefficients, generator, n_time, x_init, T, opt):
 #%%
 def sample_and_test(args):
     torch.manual_seed(42)
-    device = 'cuda:0'
+    device = f'cuda:{args.gpu}'
     
     if args.dataset == 'cifar10':
         real_img_dir = 'pytorch_fid/cifar10_train_stat.npy'
@@ -147,8 +147,9 @@ def sample_and_test(args):
     ckpt = torch.load('./saved_info/dd_gan/{}/{}/netG_{}.pth'.format(args.dataset, args.exp, args.epoch_id), map_location=device)
     
     #loading weights from ddp in single gpu
-    for key in list(ckpt.keys()):
-        ckpt[key[7:]] = ckpt.pop(key)
+    # for key in list(ckpt.keys()):
+    #     ckpt[key[7:]] = ckpt.pop(key)
+    ckpt = {k.replace('module.', ''): v for k, v in ckpt.items()}
     netG.load_state_dict(ckpt)
     netG.eval()
     
@@ -165,6 +166,10 @@ def sample_and_test(args):
         os.makedirs(save_dir)
     
     if args.compute_fid:
+        # FID recording directory
+        os.makedirs(os.path.join('fid_record', args.exp), exist_ok=True)
+        fid_record_path = os.path.join('fid_record', args.exp, f'Epoch{args.epoch_id}.txt')
+
         for i in range(iters_needed):
             with torch.no_grad():
                 x_t_1 = torch.randn(args.batch_size, args.num_channels,args.image_size, args.image_size).to(device)
@@ -181,6 +186,8 @@ def sample_and_test(args):
         kwargs = {'batch_size': 100, 'device': device, 'dims': 2048}
         fid = calculate_fid_given_paths(paths=paths, **kwargs)
         print('FID = {}'.format(fid))
+        with open(fid_record_path, 'w') as f:
+            f.write(f'{fid}')
     else:
         x_t_1 = torch.randn(args.batch_size, args.num_channels,args.image_size, args.image_size).to(device)
         fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1,T,  args)
@@ -193,6 +200,7 @@ def sample_and_test(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('ddgan parameters')
+    parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
     parser.add_argument('--compute_fid', action='store_true', default=False,
@@ -211,7 +219,7 @@ if __name__ == '__main__':
     
     parser.add_argument('--num_channels_dae', type=int, default=128,
                             help='number of initial channels in denosing model')
-    parser.add_argument('--n_mlp', type=int, default=3,
+    parser.add_argument('--n_mlp', type=int, default=4,
                             help='number of mlp layers for z')
     parser.add_argument('--ch_mult', nargs='+', type=int,
                             help='channel multiplier')

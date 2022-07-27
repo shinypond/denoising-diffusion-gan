@@ -48,3 +48,5 @@ Thumbs.db
 # CUSTOM
 data/
 saved_info/
+fid_record/
+generated_samples/
