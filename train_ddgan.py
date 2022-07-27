@@ -195,14 +195,14 @@ def D_regularize(D_real, img_real, r1_gamma):
     grad_penalty = r1_gamma / 2 * grad_penalty
     return grad_penalty
 
-def train(rank, gpu, args):
+def train(args):
     from score_sde.models.ncsnpp_generator_adagn import NCSNpp
     from EMA import EMA
     
-    torch.manual_seed(args.seed + rank)
-    torch.cuda.manual_seed(args.seed + rank)
-    torch.cuda.manual_seed_all(args.seed + rank)
-    device = torch.device('cuda:{}'.format(gpu))
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    device = torch.device(f'cuda:0')
     
     batch_size = args.batch_size
     
@@ -214,6 +214,7 @@ def train(rank, gpu, args):
                         transforms.RandomHorizontalFlip(),
                         transforms.ToTensor(),
                         transforms.Normalize((0.5,0.5,0.5), (0.5,0.5,0.5))]), download=True)
+       
     
     elif args.dataset == 'stackmnist':
         train_transform, valid_transform = _data_transforms_stacked_mnist()
@@ -242,44 +243,36 @@ def train(rank, gpu, args):
             ])
         dataset = LMDBDataset(root='/datasets/celeba-lmdb/', name='celeba', train=True, transform=train_transform)
       
-    
-    
-    train_sampler = torch.utils.data.distributed.DistributedSampler(dataset,
-                                                                    num_replicas=args.world_size,
-                                                                    rank=rank)
-    data_loader = torch.utils.data.DataLoader(dataset,
-                                               batch_size=batch_size,
-                                               shuffle=False,
-                                               num_workers=0,
-                                               pin_memory=True,
-                                               sampler=train_sampler,
-                                               drop_last = True)
+    data_loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=0,
+        drop_last=True,
+    )
     
     netG = NCSNpp(args).to(device)
-    
+
     if args.marginal:
         netD = MarginalDiscriminator(
             nc=args.num_channels,
             ngf=args.ngf,
             ch_mult=args.D_ch_mult,
             downsamples=args.downsamples,
-            t_emb_dim = args.t_emb_dim,
+            t_emb_dim=args.t_emb_dim,
             act=nn.LeakyReLU(0.2),
             spectral_norm=args.spectral_norm,
         ).to(device)
     else:
         netD = ConditionalDiscriminator(
-            nc=args.num_channels*2,
+            nc=2*args.num_channels,
             ngf=args.ngf,
             ch_mult=args.D_ch_mult,
             downsamples=args.downsamples,
-            t_emb_dim = args.t_emb_dim,
+            t_emb_dim=args.t_emb_dim,
             act=nn.LeakyReLU(0.2),
             spectral_norm=args.spectral_norm,
         ).to(device)
-    
-    broadcast_params(netG.parameters())
-    broadcast_params(netD.parameters())
     
     optimizerD = optim.Adam(netD.parameters(), lr=args.lr_d, betas = (args.beta1, args.beta2))
     optimizerG = optim.Adam(netG.parameters(), lr=args.lr_g, betas = (args.beta1, args.beta2))
@@ -290,22 +283,17 @@ def train(rank, gpu, args):
     schedulerG = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerG, args.num_epoch, eta_min=1e-5)
     schedulerD = torch.optim.lr_scheduler.CosineAnnealingLR(optimizerD, args.num_epoch, eta_min=1e-5)
     
-    
-    
-    #ddp
-    netG = nn.parallel.DistributedDataParallel(netG, device_ids=[gpu])
-    netD = nn.parallel.DistributedDataParallel(netD, device_ids=[gpu])
-
+    netG = nn.DataParallel(netG, device_ids=[0,1,2,3])
+    netD = nn.DataParallel(netD, device_ids=[0,1,2,3])
     
     exp = args.exp
     parent_dir = "./saved_info/dd_gan/{}".format(args.dataset)
 
     exp_path = os.path.join(parent_dir,exp)
-    if rank == 0:
-        if not os.path.exists(exp_path):
-            os.makedirs(exp_path)
-            copy_source(__file__, exp_path)
-            shutil.copytree('score_sde/models', os.path.join(exp_path, 'score_sde/models'))
+    if not os.path.exists(exp_path):
+        os.makedirs(exp_path)
+        copy_source(__file__, exp_path)
+        shutil.copytree('score_sde/models', os.path.join(exp_path, 'score_sde/models'))
     
     
     coeff = Diffusion_Coefficients(args, device)
@@ -332,138 +320,116 @@ def train(rank, gpu, args):
         global_step, epoch, init_epoch = 0, 0, 0
     
     
-    print(f'Parameter number of Generator : {sum(p.numel() for p in netG.parameters())}')
-    print(f'Parameter number of Discriminator : {sum(p.numel() for p in netD.parameters())}')
-    
     for epoch in range(init_epoch, args.num_epoch+1):
-        train_sampler.set_epoch(epoch)
-       
         for iteration, (x, y) in enumerate(data_loader):
-
-            # (0) Sample real data
-            real_data = x.to(device, non_blocking=True)
-
-            # (1) Update D
             for p in netD.parameters():  
                 p.requires_grad = True  
-
-            for _ in range(args.D_update_iters):
-
-                netD.zero_grad()
-
-                # (1-1) Sample t, x_t, x_(t+1)
-                t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
-                x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-                x_t.requires_grad = True
-                
-                # (1-2) Get D_real
-                D_real = netD(x_t, t, x_tp1.detach()).view(-1)
-
-                # (1-3) Get D_fake using G
-                latent_z = torch.randn(batch_size, nz, device=device)
-                x_0_predict = netG(x_tp1.detach(), t, latent_z)
-                x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-                D_fake = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-
-                # (1-4) Backward D_loss
-                if args.loss_type == 'logistic':
-                    assert args.D_update_iters == 1 # No additional updates for critic (discriminator)
-                    errD_real = F.softplus(-D_real).mean()
-                    errD_fake = F.softplus(D_fake).mean()
-                    errD = errD_real + errD_fake
-                elif args.loss_type == 'wasserstein':
-                    errD = F.relu(1. - D_real, inplace=True).mean() + F.relu(1. + D_fake, inplace=True).mean()
-                else:
-                    raise NotImplementedError
-
-                errD.backward(retain_graph=True)
-
-                # (1-5) R1 Regularization
-                if (args.lazy_reg is None) or (global_step % args.lazy_reg == 0):
-                    grad_penalty = D_regularize(D_real, x_t, args.r1_gamma)
-                    grad_penalty.backward()
-
-                optimizerD.step()
         
-            # (2) Update G
-            for p in netD.parameters():
-                p.requires_grad = False
-
-            netG.zero_grad()
-
-            # (2-1) Sample t, x_t, x_(t+1)
+            netD.zero_grad()
+            
+            #sample from p(x_0)
+            real_data = x.to(device, non_blocking=True)
+            
+            #sample t
             t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
             x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
-
-            # (2-2) Get D_fake using G
-            latent_z = torch.randn(batch_size, nz,device=device)
-            x_0_predict = netG(x_tp1.detach(), t, latent_z)
-            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
-            D_fake = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
-
-            # (2-3) Backward G_loss
+            x_t.requires_grad = True
+            
+            # train with real
+            D_real = netD(x_t, t, x_tp1.detach()).view(-1)
             if args.loss_type == 'logistic':
-                errG = F.softplus(-D_fake).mean()
+                errD_real = F.softplus(-D_real).mean()
             elif args.loss_type == 'wasserstein':
-                errG = -D_fake.mean()
+                # errD_real = F.relu(1. - D_real).mean()
+                errD_real = -D_real.mean()
+            errD_real.backward(retain_graph=True)
+
+            if args.lazy_reg is None:
+                grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
+                grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
+                grad_penalty = args.r1_gamma / 2 * grad_penalty
+                grad_penalty.backward()
             else:
-                raise NotImplementedError
+                if global_step % args.lazy_reg == 0:
+                    grad_real = torch.autograd.grad(outputs=D_real.sum(), inputs=x_t, create_graph=True)[0]
+                    grad_penalty = (grad_real.view(grad_real.size(0), -1).norm(2, dim=1) ** 2).mean()
+                    grad_penalty = args.r1_gamma / 2 * grad_penalty
+                    grad_penalty.backward()
 
-            errG.backward()
+            # train with fake
+            latent_z = torch.randn(batch_size, nz, device=device)
+            x_0_predict = netG(x_tp1.detach(), t, latent_z).detach()
+            x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+            output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+            if args.loss_type == 'logistic':
+                errD_fake = F.softplus(output).mean()
+            elif args.loss_type == 'wasserstein':
+                # errD_fake = F.relu(1. + output).mean()
+                errD_fake = output.mean()
+            errD_fake.backward()
+            errD = errD_real + errD_fake
+            # Update D
+            optimizerD.step()
 
-            optimizerG.step()
+            # Weight clipping for discriminator
+            for p in netD.parameters():
+                p.data.clamp_(-0.01, 0.01)
+        
+            # Update G
+            if global_step % args.n_critic == 0:
+                for p in netD.parameters():
+                    p.requires_grad = False
+
+                netG.zero_grad()
+                t = torch.randint(0, args.num_timesteps, (real_data.size(0),), device=device)
+                x_t, x_tp1 = q_sample_pairs(coeff, real_data, t)
+                latent_z = torch.randn(batch_size, nz,device=device)
+                x_0_predict = netG(x_tp1.detach(), t, latent_z)
+                x_pos_sample = sample_posterior(pos_coeff, x_0_predict, x_tp1, t)
+                output = netD(x_pos_sample, t, x_tp1.detach()).view(-1)
+                if args.loss_type == 'logistic':
+                    errG = F.softplus(-output).mean()
+                elif args.loss_type == 'wasserstein':
+                    errG = -output.mean()
+                errG.backward()
+                optimizerG.step()
             
             global_step += 1
-            if iteration % 10 == 0:
-                if rank == 0:
-                    print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
+            if iteration % 100 == 0:
+                print('epoch {} iteration{}, G Loss: {}, D Loss: {}'.format(epoch,iteration, errG.item(), errD.item()))
         
         if not args.no_lr_decay:
+            
             schedulerG.step()
             schedulerD.step()
         
-        if rank == 0:
-            if epoch % 10 == 0:
-                torchvision.utils.save_image(x_pos_sample, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
-            x_t_1 = torch.randn_like(real_data)
-            fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1, T, args)
-            torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=True)
-            
-            if args.save_content:
-                if epoch % args.save_content_every == 0:
-                    print('Saving content.')
-                    content = {'epoch': epoch + 1, 'global_step': global_step, 'args': args,
-                               'netG_dict': netG.state_dict(), 'optimizerG': optimizerG.state_dict(),
-                               'schedulerG': schedulerG.state_dict(), 'netD_dict': netD.state_dict(),
-                               'optimizerD': optimizerD.state_dict(), 'schedulerD': schedulerD.state_dict()}
-                    
-                    torch.save(content, os.path.join(exp_path, 'content.pth'))
+        if epoch % 10 == 0:
+            torchvision.utils.save_image(x_pos_sample, os.path.join(exp_path, 'xpos_epoch_{}.png'.format(epoch)), normalize=True)
+        
+        x_t_1 = torch.randn_like(real_data)
+        fake_sample = sample_from_model(pos_coeff, netG, args.num_timesteps, x_t_1, T, args)
+        torchvision.utils.save_image(fake_sample, os.path.join(exp_path, 'sample_discrete_epoch_{}.png'.format(epoch)), normalize=True)
+        
+        if args.save_content:
+            if epoch % args.save_content_every == 0:
+                print('Saving content.')
+                content = {'epoch': epoch + 1, 'global_step': global_step, 'args': args,
+                            'netG_dict': netG.state_dict(), 'optimizerG': optimizerG.state_dict(),
+                            'schedulerG': schedulerG.state_dict(), 'netD_dict': netD.state_dict(),
+                            'optimizerD': optimizerD.state_dict(), 'schedulerD': schedulerD.state_dict()}
                 
-            if epoch % args.save_ckpt_every == 0:
-                if args.use_ema:
-                    optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
-                    
-                torch.save(netG.state_dict(), os.path.join(exp_path, 'netG_{}.pth'.format(epoch)))
-                if args.use_ema:
-                    optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
+                torch.save(content, os.path.join(exp_path, 'content.pth'))
+            
+        if epoch % args.save_ckpt_every == 0:
+            if args.use_ema:
+                optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
+                
+            torch.save(netG.state_dict(), os.path.join(exp_path, 'netG_{}.pth'.format(epoch)))
+            if args.use_ema:
+                optimizerG.swap_parameters_with_ema(store_params_in_ema=True)
 
 
-def init_processes(rank, size, fn, args):
-    """ Initialize the distributed environment. """
-    os.environ['MASTER_ADDR'] = args.master_address
-    os.environ['MASTER_PORT'] = '6020'
-    torch.cuda.set_device(args.local_rank)
-    gpu = args.local_rank
-    dist.init_process_group(backend='nccl', init_method='env://', rank=rank, world_size=size)
-    fn(rank, gpu, args)
-    dist.barrier()
-    cleanup()  
-
-def cleanup():
-    dist.destroy_process_group()    
-#%%
 if __name__ == '__main__':
-    torch.multiprocessing.set_start_method('spawn')
     parser = argparse.ArgumentParser('ddgan parameters')
     parser.add_argument('--seed', type=int, default=1024,
                         help='seed used for initialization')
@@ -543,7 +509,7 @@ if __name__ == '__main__':
     
     # (Added) For Wasserstein loss
     parser.add_argument('--loss_type', type=str, default='logistic', choices=['logistic', 'wasserstein'], help='Type of GAN Loss')
-    parser.add_argument('--D_update_iters', type=int, default=1, help='Wasserstein Critic update iteration numbers')
+    parser.add_argument('--n_critic', type=int, default=1, help='Wasserstein Critic update iteration numbers')
     parser.add_argument('--spectral_norm', action='store_true', default=False, help='Spectral Normalization')
     
     # (Added) For Marginal Discriminator
@@ -557,32 +523,12 @@ if __name__ == '__main__':
     parser.add_argument('--save_ckpt_every', type=int, default=25, help='save ckpt every x epochs')
    
     ###ddp
-    parser.add_argument('--num_proc_node', type=int, default=1, help='The number of nodes in multi node env.')
-    parser.add_argument('--num_process_per_node', type=int, default=1, help='number of gpus')
-    parser.add_argument('--node_rank', type=int, default=0, help='The index of node.')
-    parser.add_argument('--local_rank', type=int, default=0, help='rank of process in the node')
-    parser.add_argument('--master_address', type=str, default='127.0.0.1', help='address for master')
+    # parser.add_argument('--num_proc_node', type=int, default=1, help='The number of nodes in multi node env.')
+    # parser.add_argument('--num_process_per_node', type=int, default=1, help='number of gpus')
+    # parser.add_argument('--node_rank', type=int, default=0, help='The index of node.')
+    # parser.add_argument('--local_rank', type=int, default=0, help='rank of process in the node')
+    # parser.add_argument('--master_address', type=str, default='127.0.0.1', help='address for master')
 
    
     args = parser.parse_args()
-    args.world_size = args.num_proc_node * args.num_process_per_node
-    size = args.num_process_per_node
-
-    if size > 1:
-        processes = []
-        for rank in range(size):
-            args.local_rank = rank
-            global_rank = rank + args.node_rank * args.num_process_per_node
-            global_size = args.num_proc_node * args.num_process_per_node
-            args.global_rank = global_rank
-            print('Node rank %d, local proc %d, global proc %d' % (args.node_rank, rank, global_rank))
-            p = Process(target=init_processes, args=(global_rank, global_size, train, args))
-            p.start()
-            processes.append(p)
-            
-        for p in processes:
-            p.join()
-    else:
-        print('starting in debug mode')
-        
-        init_processes(0, size, train, args)
+    train(args)
